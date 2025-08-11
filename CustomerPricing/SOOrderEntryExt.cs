@@ -1,26 +1,29 @@
-﻿using System;
+﻿using CustomerPricing;
 using PX.Common;
 using PX.Data;
-using PX.Data.BQL.Fluent;
 using PX.Data.BQL;
-using PX.Objects.IN;
+using PX.Data.BQL.Fluent;
 using PX.Objects.CM;
+using PX.Objects.IN;
 using PX.Objects.SO;
+using System;
 
 namespace PX.Objects.SO.Extensions
 {
     /*───────────────────────────────────────────────────────────────────────────────
-	 *  PURPOSE
-	 *  -------
-	 *  1.  When a discount (manual or automatic) is applied to SOLine, force the
-	 *      UnitPrice to the item’s BasePrice and keep DiscPct / DiscAmt in‑sync.
-	 *  2.  When the user clears the discount by setting DiscPct OR DiscAmt to 0,
-	 *      automatically zero the companion field, clear ManualPrice, and revert
-	 *      UnitPrice to the default list / customer price.
-	 *  3.  PXTrace diagnostics at every decision point.
-	 *  
-	 *  Compatible with C# 7.3 – no pattern‑matching syntax is used.
-	 *────────────────────────────────────────────────────────────────────────────*/
+     *  PURPOSE
+     *  -------
+     *  1.  When a discount (manual or automatic) is applied to SOLine, force the
+     *      UnitPrice to the item’s BasePrice and keep DiscPct / DiscAmt in sync.
+     *  2.  When the user clears the discount by setting DiscPct OR DiscAmt to 0,
+     *      automatically zero the companion field, clear ManualPrice, and revert
+     *      UnitPrice to the default list / customer price.
+     *  3.  Re-price every non-manual SOLine when the order’s UsrOrderPriceClass
+     *      changes so that FindSalesPrice runs with the new class.
+     *  4.  PXTrace diagnostics at every decision point.
+     *  
+     *  Compatible with C# 7.3 – no pattern-matching syntax is used.
+     *────────────────────────────────────────────────────────────────────────────*/
     public sealed class SOOrderEntrySalePriceResetExt : PXGraphExtension<SOOrderEntry>
     {
         private bool _internalUpdate;
@@ -28,11 +31,52 @@ namespace PX.Objects.SO.Extensions
 
         #region Event wiring ----------------------------------------------------
 
-        protected void _(Events.FieldUpdated<SOLine.discPct> e) => Process(e.Row as SOLine, e.Cache, nameof(SOLine.discPct));
-        protected void _(Events.FieldUpdated<SOLine.curyDiscAmt> e) => Process(e.Row as SOLine, e.Cache, nameof(SOLine.curyDiscAmt));
-        protected void _(Events.FieldUpdated<SOLine.discountID> e) => Process(e.Row as SOLine, e.Cache, nameof(SOLine.discountID));
-        protected void _(Events.FieldUpdated<SOLine.manualDisc> e) => Process(e.Row as SOLine, e.Cache, nameof(SOLine.manualDisc));
-        protected void _(Events.RowInserted<SOLine> e) => Process(e.Row as SOLine, e.Cache, "RowInserted");
+        protected void _(Events.FieldUpdated<SOLine.discPct> e) =>
+            Process(e.Row as SOLine, e.Cache, nameof(SOLine.discPct));
+
+        protected void _(Events.FieldUpdated<SOLine.curyDiscAmt> e) =>
+            Process(e.Row as SOLine, e.Cache, nameof(SOLine.curyDiscAmt));
+
+        protected void _(Events.FieldUpdated<SOLine.discountID> e) =>
+            Process(e.Row as SOLine, e.Cache, nameof(SOLine.discountID));
+
+        protected void _(Events.FieldUpdated<SOLine.manualDisc> e) =>
+            Process(e.Row as SOLine, e.Cache, nameof(SOLine.manualDisc));
+
+        protected void _(Events.RowInserted<SOLine> e) =>
+            Process(e.Row as SOLine, e.Cache, "RowInserted");
+
+        /// <summary>
+        /// Re-price all non-manual lines when the user changes UsrOrderPriceClass
+        /// on the SOOrder header.
+        /// </summary>
+        protected void _(Events.FieldUpdated<SOOrderExt.usrOrderPriceClass> e)
+        {
+            if (_internalUpdate || e.Row == null) return;
+
+            try
+            {
+                _internalUpdate = true;
+
+                foreach (SOLine line in Base.Transactions.Select())
+                {
+                    if (line.InventoryID == null || line.ManualPrice == true)
+                        continue;
+
+                    PXCache lineCache = Base.Transactions.Cache;
+
+                    lineCache.SetDefaultExt<SOLine.curyUnitPrice>(line);
+                    lineCache.SetDefaultExt<SOLine.discPct>(line);
+                    lineCache.SetDefaultExt<SOLine.curyDiscAmt>(line);
+
+                    lineCache.Update(line);
+                }
+            }
+            finally
+            {
+                _internalUpdate = false;
+            }
+        }
 
         #endregion
 
@@ -45,6 +89,11 @@ namespace PX.Objects.SO.Extensions
             PXTrace.WriteInformation(
                 $"[{trigger}] ENTER InvID={line.InventoryID}, UnitPrice={line.CuryUnitPrice}, " +
                 $"DiscPct={line.DiscPct}, DiscAmt={line.CuryDiscAmt}, ManualPrice={line.ManualPrice}");
+            if (line.InventoryID == null)
+            {
+                PXTrace.WriteInformation($"[{trigger}] InventoryID is null, skipping discount logic.");
+                return;
+            }
 
             /*----- 0. Did the user explicitly clear one of the discount fields? --------*/
             bool triggerCleared =
@@ -85,7 +134,7 @@ namespace PX.Objects.SO.Extensions
                 if (line.ManualPrice == true)
                     cache.SetValueExt<SOLine.manualPrice>(line, false);
 
-                /* Re‑default UnitPrice via field defaulting */
+                /* Re-default UnitPrice via field defaulting */
                 object listPriceObj = null;
                 cache.RaiseFieldDefaulting<SOLine.curyUnitPrice>(line, out listPriceObj);
                 if (listPriceObj is decimal listPrice)

@@ -9,7 +9,7 @@ using System.Threading.Tasks;
 namespace CustomerPricing
 {
     // Acuminator disable once PX1016 ExtensionDoesNotDeclareIsActiveMethod extension should be constantly active
-    public sealed class ARPriceClass_Ext : PXCacheExtension<ARPriceClass>
+    public sealed class ARPriceClassExt : PXCacheExtension<ARPriceClass>
     {
         #region ParentPriceClassID
         [PXDBString(10, IsUnicode = true)]

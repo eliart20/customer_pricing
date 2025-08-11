@@ -11,8 +11,10 @@ namespace PX.Objects.SO
     /// <summary>
     /// Adds read-only Default Price and calculated Customer Discount (%) to SOLine.
     /// </summary>
+
     public sealed class SOLineExt : PXCacheExtension<SOLine>
     {
+            
         /* -------------------------------------------------------------
          * Default Price (UsrDefaultPrice)
          * -----------------------------------------------------------*/

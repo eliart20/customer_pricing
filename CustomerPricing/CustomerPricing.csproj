@@ -58,10 +58,13 @@
     <Reference Include="System.Xml" />
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="ARPriceClass_Ext.cs" />
+    <Compile Include="ARPriceClassExt.cs" />
+    <Compile Include="ARPriceWorksheetDetailExt.cs" />
+    <Compile Include="ARPriceworksheetMaintExt.cs" />
     <Compile Include="ARSalesPriceMaintExt.cs" />
-    <Compile Include="DiscountEngineExt.cs" />
+    <Compile Include="CopyItemExt.cs" />
     <Compile Include="InventoryItemMaintExt.cs" />
+    <Compile Include="PriceHierarchyDisplay.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="ARSalesPriceExt.cs" />
     <Compile Include="SOLineExt.cs" />

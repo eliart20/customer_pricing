@@ -76,10 +76,6 @@ namespace CustomerPricing
                     if (candidate != null && (candidate.PriceType == "P" || candidate.PriceType == "C"))
                     {
                         // Replace the problematic line with the following code  
-                        var percentoff = sender.GetExtension<ARSalesPriceExt>(candidate)?.UsrPricePercentOff;
-                        if (percentoff != null && percentoff > 0)
-                        {
-                        }
                         return candidate;
                     }
 
@@ -88,7 +84,7 @@ namespace CustomerPricing
 
                     // Climb to parent class.
                     var pc = ARPriceClass.PK.Find(Base, nextClass);
-                    nextClass = pc?.GetExtension<ARPriceClass_Ext>()?.ParentPriceClassID;
+                    nextClass = pc?.GetExtension<ARPriceClassExt>()?.ParentPriceClassID;
                 }
             }
 
