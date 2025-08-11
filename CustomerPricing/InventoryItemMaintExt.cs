@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Linq;
+using PX.Common;
 using PX.Data;
 using PX.Data.BQL;
 using PX.Data.BQL.Fluent;
@@ -9,17 +10,28 @@ using PX.Objects.IN;
 namespace CustomerPricing
 {
     /*───────────────────── Price cascade helper ─────────────────────*/
-    internal static class PriceCascade
+    public static class PriceCascade
     {
-        /// <summary>“B” = base price row in ARSalesPrice.</summary>
+        internal const string SkipCascadeSlot = "CustomerPricing.PriceCascade.Skip";
+        public static bool IsSuppressed => PXContext.GetSlot<string>(SkipCascadeSlot) != null;
+        public static IDisposable Suppress() => new SlotScope(SkipCascadeSlot, "1");
+
+        private sealed class SlotScope : IDisposable
+        {
+            private readonly string _key;
+            private readonly string _prev;
+            public SlotScope(string key, string value)
+            {
+                _key = key;
+                _prev = PXContext.GetSlot<string>(key);
+                PXContext.SetSlot(key, value);
+            }
+            public void Dispose() => PXContext.SetSlot(_key, _prev);
+        }
+
         private sealed class PriceTypeBase : BqlString.Constant<PriceTypeBase>
         { public PriceTypeBase() : base("B") { } }
 
-        /// <summary>
-        /// Recalculates every non‑base <see cref="ARSalesPrice"/> row for the given inventory ID
-        /// according to the UsrPricePercentOff field of <see cref="ARSalesPriceExt"/>.
-        /// All changes are staged in <paramref name="graph"/>, caller controls the final Persist.
-        /// </summary>
         public static void UpdateSalesPrices(PXGraph graph, int? inventoryID, decimal basePrice)
         {
             if (inventoryID == null) return;
@@ -32,9 +44,7 @@ namespace CustomerPricing
                 decimal? pct = pr.GetExtension<ARSalesPriceExt>()?.UsrPricePercentOff;
                 if (pct == null) continue;
 
-                // round to four decimals – same precision ARSalesPrice.SalesPrice uses
-                decimal newPrice = Math.Round(basePrice * (1 - pct.Value / 100m), 4,
-                                              MidpointRounding.AwayFromZero);
+                decimal newPrice = Math.Round(basePrice * (1 - pct.Value / 100m), 4, MidpointRounding.AwayFromZero);
 
                 if (pr.SalesPrice != newPrice)
                 {
@@ -55,7 +65,8 @@ namespace CustomerPricing
         [PXOverride]
         public void Persist(PersistDelegate baseMethod)
         {
-            ApplyPriceCascade();
+            if (!PriceCascade.IsSuppressed)
+                ApplyPriceCascade();
             baseMethod();
         }
 
@@ -63,16 +74,21 @@ namespace CustomerPricing
         {
             var cache = Base.Caches<InventoryItemCurySettings>();
 
-            foreach (InventoryItemCurySettings row in cache.Inserted.Cast<InventoryItemCurySettings>()
-                     .Concat(cache.Updated.Cast<InventoryItemCurySettings>()))
+            foreach (InventoryItemCurySettings row in cache.Updated.Cast<InventoryItemCurySettings>())
             {
-                if (row?.BasePrice != null)
-                    PriceCascade.UpdateSalesPrices(Base, row.InventoryID, row.BasePrice.Value);
+                var oldBase = (decimal?)cache.GetValueOriginal<InventoryItemCurySettings.basePrice>(row);
+                if (row?.BasePrice == null || oldBase == null || row.BasePrice == oldBase || row.BasePrice <= 0)
+                    continue;
+
+                PXTrace.WriteInformation("Cascade: InventoryID={0} Cury={1} BasePrice changed {2} -> {3}",
+                    row.InventoryID, row.CuryID, oldBase, row.BasePrice);
+
+                PriceCascade.UpdateSalesPrices(Base, row.InventoryID, row.BasePrice.Value);
             }
         }
     }
 
-    /*───────────────────── Non‑stock items (IN203000) ────────────────*/
+    /*───────────────────── Non-stock items (IN203000) ────────────────*/
     public sealed class NonStockItemMaintPriceCascadeExt
         : PXGraphExtension<PX.Objects.IN.NonStockItemMaint>
     {
@@ -82,7 +98,8 @@ namespace CustomerPricing
         [PXOverride]
         public void Persist(PersistDelegate baseMethod)
         {
-            ApplyPriceCascade();
+            if (!PriceCascade.IsSuppressed)
+                ApplyPriceCascade();
             baseMethod();
         }
 
@@ -90,11 +107,16 @@ namespace CustomerPricing
         {
             var cache = Base.Caches<InventoryItemCurySettings>();
 
-            foreach (InventoryItemCurySettings row in cache.Inserted.Cast<InventoryItemCurySettings>()
-                     .Concat(cache.Updated.Cast<InventoryItemCurySettings>()))
+            foreach (InventoryItemCurySettings row in cache.Updated.Cast<InventoryItemCurySettings>())
             {
-                if (row?.BasePrice != null)
-                    PriceCascade.UpdateSalesPrices(Base, row.InventoryID, row.BasePrice.Value);
+                var oldBase = (decimal?)cache.GetValueOriginal<InventoryItemCurySettings.basePrice>(row);
+                if (row?.BasePrice == null || oldBase == null || row.BasePrice == oldBase)
+                    continue;
+
+                PXTrace.WriteInformation("Cascade(NS): InventoryID={0} Cury={1} BasePrice changed {2} -> {3}",
+                    row.InventoryID, row.CuryID, oldBase, row.BasePrice);
+
+                PriceCascade.UpdateSalesPrices(Base, row.InventoryID, row.BasePrice.Value);
             }
         }
     }

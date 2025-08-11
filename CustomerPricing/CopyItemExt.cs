@@ -1,4 +1,8 @@
-﻿using PX.Common;
+﻿// PX.Custom.IN/InventoryItemMaint_CopyItemExt.cs
+#pragma warning disable PX1050
+#pragma warning disable PX1016
+#pragma warning disable PX1072
+using PX.Common;
 using PX.Data;
 using PX.Data.BQL;
 using PX.Data.BQL.Fluent;
@@ -6,6 +10,8 @@ using PX.Objects.AR;
 using PX.Objects.IN;
 using System;
 using System.Collections;
+using System.Linq;
+using CustomerPricing; // for PriceCascade.Suppress()
 
 namespace PX.Custom.IN
 {
@@ -64,8 +70,41 @@ namespace PX.Custom.IN
 
     public class InventoryItemMaint_CopyItemExt : PXGraphExtension<InventoryItemMaint>
     {
+        private const string SkipSetDefaultSiteSlot = "PX.Custom.IN.CopyItem.SkipSetDefaultSite";
+
         public PXAction<InventoryItem> CopyItem;
         public PXFilter<INCopyItemFilter> CopyDialog;
+
+        // Prevent default-site logic on temporary rows
+        public delegate void SetDefaultSiteIDDelegate(InventoryItem row, bool allCurrencies);
+        [PXOverride]
+        public virtual void SetDefaultSiteID(InventoryItem row, bool allCurrencies, SetDefaultSiteIDDelegate baseMethod)
+        {
+            bool suppress = (row?.InventoryID ?? 0) < 0 || PXContext.GetSlot<string>(SkipSetDefaultSiteSlot) != null;
+            if (!suppress) baseMethod(row, allCurrencies);
+        }
+
+        protected void _(Events.FieldDefaulting<InventoryItemCurySettings, InventoryItemCurySettings.dfltSiteID> e)
+        {
+            if (e.Row?.InventoryID < 0)
+            {
+                e.NewValue = null;
+                e.Cancel = true;
+            }
+        }
+        protected void _(Events.FieldVerifying<InventoryItemCurySettings, InventoryItemCurySettings.dfltSiteID> e)
+        {
+            if (e.Row?.InventoryID < 0)
+            {
+                e.NewValue = null;
+                e.Cancel = true;
+            }
+        }
+        protected void _(Events.RowInserted<InventoryItemCurySettings> e)
+        {
+            if (e.Row?.InventoryID < 0 && e.Row.DfltSiteID != null)
+                e.Cache.SetValue<InventoryItemCurySettings.dfltSiteID>(e.Row, null);
+        }
 
         [PXButton(CommitChanges = true)]
         [PXUIField(DisplayName = "Copy Item", MapEnableRights = PXCacheRights.Select, MapViewRights = PXCacheRights.Select)]
@@ -74,20 +113,16 @@ namespace PX.Custom.IN
             if (Base.Item.Current == null || PXLongOperation.Exists(Base))
                 return adapter.Get();
 
-            PXTrace.WriteInformation("CopyItem action started.");
-
-            WebDialogResult result = CopyDialog.AskExt((graph, viewName) =>
+            var result = CopyDialog.AskExt((_, __) =>
             {
                 var src = Base.Item.Current;
                 var f = CopyDialog.Current ?? CopyDialog.Insert(new INCopyItemFilter());
-
                 if (string.IsNullOrWhiteSpace(f.InventoryCDNew))
                     f.InventoryCDNew = (src.InventoryCD ?? string.Empty).Trim() + "-COPY";
                 if (f.DescriptionNew == null)
                     f.DescriptionNew = src.Descr;
 
-                object v;
-                v = Base.Item.Cache.GetValue(src, "UsrCopyrightDate");
+                object v = Base.Item.Cache.GetValue(src, "UsrCopyrightDate");
                 if (v is DateTime dt) f.UsrCopyrightDate = dt;
 
                 v = Base.Item.Cache.GetValue(src, "UsrIsbn13");
@@ -101,20 +136,13 @@ namespace PX.Custom.IN
                 return adapter.Get();
 
             var filter = CopyDialog.Current;
-            if (filter == null)
-                return adapter.Get();
-
-            if (string.IsNullOrWhiteSpace(filter.InventoryCDNew))
+            if (filter == null || string.IsNullOrWhiteSpace(filter.InventoryCDNew))
                 throw new PXSetPropertyException<INCopyItemFilter.inventoryCDNew>("Item Name is required.");
-
-            PXTrace.WriteInformation(
-                "Copying item {0} ({1}) to new code {2}.",
-                Base.Item.Current.InventoryID, Base.Item.Current.InventoryCD, filter.InventoryCDNew?.Trim());
 
             var cmd = new CopyParams
             {
                 SrcInventoryID = Base.Item.Current.InventoryID,
-                NewInventoryCD = filter.InventoryCDNew?.Trim(),
+                NewInventoryCD = filter.InventoryCDNew.Trim(),
                 NewDescription = filter.DescriptionNew,
                 UsrIsbn13 = filter.UsrIsbn13,
                 UsrIsbn10 = filter.UsrIsbn10,
@@ -143,174 +171,111 @@ namespace PX.Custom.IN
             public static void Execute(CopyParams p)
             {
                 if (p?.SrcInventoryID == null)
-                    throw new PXException("Source item is not specified.");
+                    throw new PXException("Source item not found.");
+
+                InventoryItemMaint graph = PXGraph.CreateInstance<InventoryItemMaint>();
+                DateTime bizDate = graph.Accessinfo.BusinessDate ?? PXTimeZoneInfo.Now;
 
                 using (var ts = new PXTransactionScope())
                 {
-                    var selGraph = new PXGraph();
-                    var src = SelectFrom<InventoryItem>
-                        .Where<InventoryItem.inventoryID.IsEqual<@P.AsInt>>
-                        .View.Select(selGraph, p.SrcInventoryID).TopFirst
-                        ?? throw new PXException("Source item {0} not found.", p.SrcInventoryID);
-
-                    var newItem = CreateCopyOfItem(src, p);
-
-                    if (newItem?.InventoryID == null || newItem.InventoryID <= 0)
-                        throw new PXException("New item was not persisted. InventoryID={0}", newItem?.InventoryID);
-
-                    PXTrace.WriteInformation("New item persisted. InventoryID={0}, InventoryCD={1}",
-                        newItem.InventoryID, newItem.InventoryCD);
-
-                    if (p.CopyPrices)
+                    PXContext.SetSlot<string>(SkipSetDefaultSiteSlot, "1");
+                    try
                     {
-                        try
-                        {
-                            CopyItemBasePrices(src.InventoryID, newItem.InventoryID);
+                        InventoryItem src =
+                            SelectFrom<InventoryItem>
+                            .Where<InventoryItem.inventoryID.IsEqual<@P.AsInt>>
+                            .View.Select(graph, p.SrcInventoryID)
+                            .TopFirst
+                            ?? throw new PXException("Source item was deleted.");
 
-                            var ctx = PXGraph.CreateInstance<PXGraph>();
-                            DateTime asOf = ctx.Accessinfo.BusinessDate ?? PXTimeZoneInfo.Today;
+                        // Clone
+                        InventoryItem newItem = (InventoryItem)graph.Item.Cache.CreateCopy(src);
+                        newItem.InventoryID = null;
+                        newItem.NoteID = null;
+                        newItem.InventoryCD = p.NewInventoryCD;
+                        newItem.Descr = p.NewDescription;
 
-                            CopyActiveSalesPrices(src.InventoryID, newItem.InventoryID, asOf);
-                        }
-                        catch (Exception ex)
-                        {
-                            PXTrace.WriteError(ex);
-                            throw;
-                        }
+                        newItem = graph.Item.Insert(newItem);
+
+                        PXCache itemCache = graph.Item.Cache;
+                        itemCache.SetValueExt(newItem, "UsrIsbn13", p.UsrIsbn13);
+                        itemCache.SetValueExt(newItem, "UsrIsbn10", p.UsrIsbn10);
+                        itemCache.SetValueExt(newItem, "UsrCopyrightDate", p.UsrCopyrightDate);
+                        graph.Item.Update(newItem);
+                        graph.Actions.PressSave();
+
+                        int? newID = newItem.InventoryID;
+
+                        if (p.CopyPrices)
+                            UpsertActiveSalesPrices(newID, p.SrcInventoryID, bizDate);
+                        else
+                            ZeroDefaultPrices(graph, newID);
+
+                        ts.Complete();
                     }
-
-                    ts.Complete();
-
-                    var targetGraph = PXGraph.CreateInstance<InventoryItemMaint>();
-                    targetGraph.Item.Current = SelectFrom<InventoryItem>
-                        .Where<InventoryItem.inventoryID.IsEqual<@P.AsInt>>
-                        .View.Select(targetGraph, newItem.InventoryID).TopFirst;
-
-                    throw new PXRedirectRequiredException(targetGraph, true, "New Item");
+                    finally
+                    {
+                        PXContext.SetSlot<string>(SkipSetDefaultSiteSlot, null);
+                    }
                 }
             }
 
-            private static InventoryItem CreateCopyOfItem(InventoryItem src, CopyParams p)
+            private static void ZeroDefaultPrices(InventoryItemMaint g, int? inventoryID)
             {
-                var g = PXGraph.CreateInstance<InventoryItemMaint>();
-
-                var copy = PXCache<InventoryItem>.CreateCopy(src);
-                copy.InventoryID = null;
-                copy.NoteID = null;
-                copy.InventoryCD = p.NewInventoryCD;
-                copy.Descr = p.NewDescription;
-
-                // Insert -> update custom fields -> save
-                copy = g.Item.Insert(copy);
-
-                g.Item.Cache.SetValueExt(copy, "UsrIsbn13", p.UsrIsbn13);
-                g.Item.Cache.SetValueExt(copy, "UsrIsbn10", p.UsrIsbn10);
-                g.Item.Cache.SetValueExt(copy, "UsrCopyrightDate", p.UsrCopyrightDate);
-
-                copy = g.Item.Update(copy);
+                foreach (InventoryItemCurySettings s in
+                         SelectFrom<InventoryItemCurySettings>
+                         .Where<InventoryItemCurySettings.inventoryID.IsEqual<@P.AsInt>>
+                         .View.Select(g, inventoryID).RowCast<InventoryItemCurySettings>())
+                {
+                    s.BasePrice = 0m;
+                    g.ItemCurySettings.Update(s);
+                }
                 g.Actions.PressSave();
-
-                // IMPORTANT: reselect persisted row to ensure positive key (avoid leaking temporary negative IDs)
-                var persisted = g.Item.Current;
-                if (persisted?.InventoryID == null || persisted.InventoryID <= 0)
-                {
-                    persisted = SelectFrom<InventoryItem>
-                        .Where<InventoryItem.inventoryCD.IsEqual<@P.AsString>>
-                        .View.Select(g, p.NewInventoryCD).TopFirst;
-                }
-
-                if (persisted?.InventoryID == null || persisted.InventoryID <= 0)
-                    throw new PXException("Failed to reselect persisted item for {0}.", p.NewInventoryCD);
-
-                return persisted;
             }
 
-            private static void CopyItemBasePrices(int? srcInventoryID, int? dstInventoryID)
+            private static void UpsertActiveSalesPrices(int? newID, int? srcID, DateTime asOf)
             {
-                if (srcInventoryID == null || dstInventoryID == null)
-                    return;
-                if (dstInventoryID <= 0)
-                    throw new PXException("Invalid dst InventoryID: {0}", dstInventoryID);
+                if (newID == null || srcID == null) return;
 
-                var g = new PXGraph();
-
-                var srcSettings = SelectFrom<InventoryItemCurySettings>
-                    .Where<InventoryItemCurySettings.inventoryID.IsEqual<@P.AsInt>>
-                    .View.Select(g, srcInventoryID);
-
-                var cache = g.Caches<InventoryItemCurySettings>();
-
-                foreach (InventoryItemCurySettings s in srcSettings)
+                using (PriceCascade.Suppress())
                 {
-                    var existing = SelectFrom<InventoryItemCurySettings>
-                        .Where<InventoryItemCurySettings.inventoryID.IsEqual<@P.AsInt>
-                            .And<InventoryItemCurySettings.curyID.IsEqual<@P.AsString>>>
-                        .View.Select(g, dstInventoryID, s.CuryID)
-                        .TopFirst;
+                    PXGraph g = new PXGraph();
+                    PXCache spCache = g.Caches<ARSalesPrice>();
 
-                    InventoryItemCurySettings clone = existing ?? new InventoryItemCurySettings
+                    var active = SelectFrom<ARSalesPrice>
+                                 .Where<ARSalesPrice.inventoryID.IsEqual<@P.AsInt>>
+                                 .View.Select(g, srcID)
+                                 .RowCast<ARSalesPrice>()
+                                 .Where(sp => IsActive(sp, asOf));
+
+                    foreach (ARSalesPrice src in active)
                     {
-                        InventoryID = dstInventoryID,
-                        CuryID = s.CuryID
-                    };
+                        ARSalesPrice dst = (ARSalesPrice)spCache.CreateInstance();
 
-                    clone.BasePrice = s.BasePrice;
-                    clone.RecPrice = s.RecPrice;
+                        dst.InventoryID = newID;
+                        dst.PriceType = src.PriceType;
+                        dst.PriceCode = src.PriceCode;
+                        dst.UOM = src.UOM;
+                        dst.CuryID = src.CuryID;
+                        dst.BreakQty = src.BreakQty;
+                        dst.SalesPrice = src.SalesPrice;
+                        dst.SiteID = src.SiteID;
+                        dst.EffectiveDate = src.EffectiveDate;
+                        dst.ExpirationDate = src.ExpirationDate;
+                        dst.CustomerID = src.CustomerID;
+                        dst.PriceClassID = src.PriceClassID;
 
-                    if (existing == null)
-                        cache.Insert(clone);
-                    else
-                        cache.Update(clone);
+                        spCache.Insert(dst);
+                    }
+                    g.Persist();
                 }
-
-                g.Persist();
             }
 
-            private static void CopyActiveSalesPrices(int? srcInventoryID, int? dstInventoryID, DateTime asOfDate)
+            private static bool IsActive(ARSalesPrice sp, DateTime asOf)
             {
-                if (srcInventoryID == null || dstInventoryID == null)
-                    return;
-                if (dstInventoryID <= 0)
-                    throw new PXException("Invalid dst InventoryID: {0}", dstInventoryID);
-
-                var g = new PXGraph();
-
-                var prices = SelectFrom<ARSalesPrice>
-                    .Where<
-                        ARSalesPrice.inventoryID.IsEqual<@P.AsInt>
-                        .And<ARSalesPrice.effectiveDate.IsLessEqual<@P.AsDateTime>>
-                        .And<
-                            Brackets<
-                                ARSalesPrice.expirationDate.IsNull
-                                .Or<ARSalesPrice.expirationDate.IsGreaterEqual<@P.AsDateTime>>
-                            >
-                        >
-                    >
-                    .View.Select(g, srcInventoryID, asOfDate, asOfDate);
-
-                var cache = g.Caches<ARSalesPrice>();
-
-                foreach (ARSalesPrice p in prices)
-                {
-                    var np = new ARSalesPrice
-                    {
-                        PriceType = p.PriceType,
-                        PriceCode = p.PriceCode,
-                        InventoryID = dstInventoryID,
-                        UOM = p.UOM,
-                        BreakQty = p.BreakQty,
-                        CuryID = p.CuryID,
-                        SalesPrice = p.SalesPrice,
-                        EffectiveDate = p.EffectiveDate,
-                        ExpirationDate = p.ExpirationDate,
-                        IsPromotionalPrice = p.IsPromotionalPrice,
-                        TaxCategoryID = p.TaxCategoryID,
-                    };
-
-                    cache.Insert(np);
-                }
-
-                g.Persist();
+                bool dateOk = (sp.EffectiveDate == null || sp.EffectiveDate.Value.Date <= asOf.Date) &&
+                              (sp.ExpirationDate == null || sp.ExpirationDate.Value.Date >= asOf.Date);
+                return dateOk && (sp.SalesPrice == null || sp.SalesPrice >= 0m);
             }
         }
     }
