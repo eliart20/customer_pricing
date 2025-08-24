@@ -64,36 +64,6 @@ namespace PX.Custom.IN
         #endregion
     }
 
-    // Custom class to handle completion after PXLongOperation
-    public class ItemCopyCompletedInfo : IPXCustomInfo
-    {
-        private readonly int? _inventoryID;
-        private readonly string _inventoryCD;
-        
-        public ItemCopyCompletedInfo(int? inventoryID, string inventoryCD)
-        {
-            _inventoryID = inventoryID;
-            _inventoryCD = inventoryCD;
-        }
-        
-        public void Complete(PXLongRunStatus status, PXGraph graph)
-        {
-            if (status == PXLongRunStatus.Completed && _inventoryID != null)
-            {
-                // Navigate to the new item in the same window
-                // This properly completes the operation
-                InventoryItemMaint redirectGraph = PXGraph.CreateInstance<InventoryItemMaint>();
-                redirectGraph.Item.Current = redirectGraph.Item.Search<InventoryItem.inventoryID>(_inventoryID);
-                
-                if (redirectGraph.Item.Current != null)
-                {
-                    // Same window redirect - operation completes properly
-                    throw new PXRedirectRequiredException(redirectGraph, false, "Item Copied");
-                }
-            }
-        }
-    }
-
     public class InventoryItemMaint_CopyItemExt : PXGraphExtension<InventoryItemMaint>
     {
         private const string SkipSetDefaultSiteSlot = "PX.Custom.IN.CopyItem.SkipSetDefaultSite";
@@ -156,26 +126,37 @@ namespace PX.Custom.IN
                 CopyPrices = ftr.CopyPrices == true
             };
 
-            // Store the new inventory CD for the custom info
-            string newInventoryCD = cmd.NewInventoryCD;
-
             PXLongOperation.StartOperation(Base, delegate()
             {
                 try
                 {
                     var newInventoryID = Worker.Execute(cmd);
                     PXTrace.WriteInformation("REDIRECT: Worker completed, newInventoryID={0}", newInventoryID);
-                    
-                    if (newInventoryID != null)
-                    {
-                        // Set custom info to handle redirect after operation completes
-                        // This ensures the long operation completes before redirect
-                        PXLongOperation.SetCustomInfo(new ItemCopyCompletedInfo(newInventoryID, newInventoryCD));
-                    }
-                    else
-                    {
+
+                    if (newInventoryID == null)
                         throw new PXException("Failed to create new item.");
-                    }
+
+                    // Redirect immediately from inside the long-op context.
+                    var redirectGraph = PXGraph.CreateInstance<InventoryItemMaint>();
+                    redirectGraph.Clear();
+
+                    // Prefer key search by InventoryCD which matches the primary view key.
+                    var newRow = redirectGraph.Item.Search<InventoryItem.inventoryCD>(cmd.NewInventoryCD)
+                               ?? redirectGraph.Item.Search<InventoryItem.inventoryID>(newInventoryID);
+
+                    if (newRow == null)
+                        throw new PXException("New item not found after copy.");
+
+                    redirectGraph.Item.Current = newRow;
+
+                    var ex = new PXRedirectRequiredException(redirectGraph, "Item Copied");
+                    ex.Mode = PXBaseRedirectException.WindowMode.Same;
+                    throw ex;
+                }
+                catch (PXRedirectRequiredException)
+                {
+                    // Rethrow redirect as-is to let the framework handle it.
+                    throw;
                 }
                 catch (Exception ex)
                 {
