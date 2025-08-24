@@ -12,7 +12,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
-using CustomerPricing;       // PriceCascade.Suppress()
+using CustomerPricing;          // PriceCascade.Suppress()
 
 namespace PX.Custom.IN
 {
@@ -22,7 +22,7 @@ namespace PX.Custom.IN
     {
         #region InventoryCDNew
         public abstract class inventoryCDNew : BqlString.Field<inventoryCDNew> { }
-        [PXString(60, IsUnicode = true)]
+        [PXString(10, IsUnicode = true)]
         [PXUIField(DisplayName = "Item Name")]
         [PXDefault(PersistingCheck = PXPersistingCheck.Nothing)]
         public string InventoryCDNew { get; set; }
@@ -36,22 +36,22 @@ namespace PX.Custom.IN
         #endregion
         #region UsrIsbn13
         public abstract class usrIsbn13 : BqlString.Field<usrIsbn13> { }
-        [PXString(32, IsUnicode = true)]
-        [PXUIField(DisplayName = "UsrIsbn13")]
+        [PXString(35, IsUnicode = true)]
+        [PXUIField(DisplayName = "ISBN 13")]
         [PXDefault(PersistingCheck = PXPersistingCheck.Nothing)]
         public string UsrIsbn13 { get; set; }
         #endregion
         #region UsrIsbn10
         public abstract class usrIsbn10 : BqlString.Field<usrIsbn10> { }
         [PXString(32, IsUnicode = true)]
-        [PXUIField(DisplayName = "UsrIsbn10")]
+        [PXUIField(DisplayName = "ISBN 10")]
         [PXDefault(PersistingCheck = PXPersistingCheck.Nothing)]
         public string UsrIsbn10 { get; set; }
         #endregion
         #region UsrCopyrightDate
         public abstract class usrCopyrightDate : BqlDateTime.Field<usrCopyrightDate> { }
         [PXDate]
-        [PXUIField(DisplayName = "UsrCopyrightDate")]
+        [PXUIField(DisplayName = "Copyright Date")]
         [PXDefault(PersistingCheck = PXPersistingCheck.Nothing)]
         public DateTime? UsrCopyrightDate { get; set; }
         #endregion
@@ -64,6 +64,42 @@ namespace PX.Custom.IN
         #endregion
     }
 
+    // Custom class to handle redirect after PXLongOperation completes
+    public class RedirectToItemCustomInfo : IPXCustomInfo
+    {
+        private readonly int? _inventoryID;
+        
+        public RedirectToItemCustomInfo(int? inventoryID)
+        {
+            _inventoryID = inventoryID;
+        }
+        
+        public void Complete(PXLongRunStatus status, PXGraph graph)
+        {
+            if (status == PXLongRunStatus.Completed && _inventoryID != null)
+            {
+                // Create a fresh graph instance for the redirect
+                InventoryItemMaint redirectGraph = PXGraph.CreateInstance<InventoryItemMaint>();
+                
+                // Force database read using PXSelectReadOnly to avoid cache issues
+                InventoryItem newItem = PXSelect<InventoryItem,
+                    Where<InventoryItem.inventoryID, Equal<Required<InventoryItem.inventoryID>>>>
+                    .Select(redirectGraph, _inventoryID);
+                
+                if (newItem != null)
+                {
+                    // Set the current item explicitly
+                    redirectGraph.Item.Current = newItem;
+                    redirectGraph.Item.Cache.IsDirty = false;
+                    
+                    // Use PXRedirectRequiredException without WindowMode for same window
+                    // The 'false' parameter ensures same window navigation
+                    throw new PXRedirectRequiredException(redirectGraph, true, "Item Copied");
+                }
+            }
+        }
+    }
+
     public class InventoryItemMaint_CopyItemExt : PXGraphExtension<InventoryItemMaint>
     {
         private const string SkipSetDefaultSiteSlot = "PX.Custom.IN.CopyItem.SkipSetDefaultSite";
@@ -71,7 +107,7 @@ namespace PX.Custom.IN
         public PXAction<InventoryItem> CopyItem;
         public PXFilter<INCopyItemFilter> CopyDialog;
 
-        #region Site‑default suppression
+        #region Site-default suppression
         public delegate void SetDefaultSiteIDDelegate(InventoryItem row, bool allCurrencies);
         [PXOverride]
         public virtual void SetDefaultSiteID(InventoryItem row, bool allCurrencies, SetDefaultSiteIDDelegate baseMethod)
@@ -100,11 +136,6 @@ namespace PX.Custom.IN
             {
                 var src = Base.Item.Current;
                 var f = CopyDialog.Current ?? CopyDialog.Insert(new INCopyItemFilter());
-                if (string.IsNullOrWhiteSpace(f.InventoryCDNew))
-                    f.InventoryCDNew = $"{(src.InventoryCD ?? "").Trim()}-COPY";
-                if (f.DescriptionNew == null)
-                    f.DescriptionNew = src.Descr;
-
                 object v = Base.Item.Cache.GetValue(src, "UsrCopyrightDate");
                 if (v is DateTime dt) f.UsrCopyrightDate = dt;
                 v = Base.Item.Cache.GetValue(src, "UsrIsbn13");
@@ -130,7 +161,23 @@ namespace PX.Custom.IN
                 UsrCopyrightDate = ftr.UsrCopyrightDate,
                 CopyPrices = ftr.CopyPrices == true
             };
-            PXLongOperation.StartOperation(Base, () => Worker.Execute(cmd));
+
+            PXLongOperation.StartOperation(Base, delegate()
+            {
+                var newInventoryID = Worker.Execute(cmd);
+                PXTrace.WriteInformation("REDIRECT: Worker completed, newInventoryID={0}", newInventoryID);
+                
+                if (newInventoryID != null)
+                {
+                    // Set custom info to handle redirect after operation completes
+                    PXLongOperation.SetCustomInfo(new RedirectToItemCustomInfo(newInventoryID));
+                }
+                else
+                {
+                    throw new PXException("Failed to create new item.");
+                }
+            });
+
             return adapter.Get();
         }
         #endregion
@@ -151,18 +198,18 @@ namespace PX.Custom.IN
 
         private static class Worker
         {
-            /*‑‑‑ price‑type literals (avoids compile‑time dependency on DAC constant holders) ‑‑‑*/
-            private const string PRICE_TYPE_BASE = "B";
-            private const string PRICE_TYPE_CUSTOMER = "C";
-            private const string PRICE_TYPE_CUSTOMER_CLASS = "P";
-            private const string PRICE_TYPE_ALL_CUSTOMERS = "A";
-            /*-----------------------------------------------------------------------------------*/
+            /*--- price-type literals ---*/
+            private const string PT_BASE = "B";
+            private const string PT_CUSTOMER = "C";
+            private const string PT_CUSTOMER_CLASS = "P";
+            private const string PT_ALL_CUSTOMERS = "A";
+            /*---------------------------*/
 
-            internal static void Execute(CopyParams p)
+            internal static int? Execute(CopyParams p)
             {
                 if (p?.SrcInventoryID == null) throw new PXException("Source item not found.");
 
-                PXTrace.WriteInformation("COPY‑ITEM start: SrcID={0}, NewCD={1}, CopyPrices={2}",
+                PXTrace.WriteInformation("COPY-ITEM start: SrcID={0}, NewCD={1}, CopyPrices={2}",
                     p.SrcInventoryID, p.NewInventoryCD, p.CopyPrices);
 
                 var itemGraph = PXGraph.CreateInstance<InventoryItemMaint>();
@@ -187,10 +234,10 @@ namespace PX.Custom.IN
                         newItem.Descr = p.NewDescription;
                         newItem = itemGraph.Item.Insert(newItem);
 
-                        var itemCache = itemGraph.Item.Cache;
-                        itemCache.SetValueExt(newItem, "UsrIsbn13", p.UsrIsbn13);
-                        itemCache.SetValueExt(newItem, "UsrIsbn10", p.UsrIsbn10);
-                        itemCache.SetValueExt(newItem, "UsrCopyrightDate", p.UsrCopyrightDate);
+                        var cache = itemGraph.Item.Cache;
+                        cache.SetValueExt(newItem, "UsrIsbn13", p.UsrIsbn13);
+                        cache.SetValueExt(newItem, "UsrIsbn10", p.UsrIsbn10);
+                        cache.SetValueExt(newItem, "UsrCopyrightDate", p.UsrCopyrightDate);
                         itemGraph.Item.Update(newItem);
                         itemGraph.Actions.PressSave();
                         int? newID = newItem.InventoryID;
@@ -203,7 +250,8 @@ namespace PX.Custom.IN
                             ZeroDefaultPrices(itemGraph, newID);
 
                         ts.Complete();
-                        PXTrace.WriteInformation("COPY‑ITEM done: NewID={0}", newID);
+                        PXTrace.WriteInformation("COPY-ITEM done: NewID={0}", newID);
+                        return newID;
                     }
                     finally
                     {
@@ -212,7 +260,7 @@ namespace PX.Custom.IN
                 }
             }
 
-            #region Price copy helpers
+            #region Price helpers
             private static void ZeroDefaultPrices(InventoryItemMaint g, int? inventoryID)
             {
                 foreach (InventoryItemCurySettings s in
@@ -227,18 +275,25 @@ namespace PX.Custom.IN
                 PXTrace.WriteInformation("Base prices zeroed for item {0}", inventoryID);
             }
 
+            private static string DumpRow(PXCache cache, object row)
+            {
+                return string.Join(", ",
+                    cache.Fields
+                         .Select(f => $"{f}={cache.GetValue(row, f) ?? "<null>"}"));
+            }
+
             private static void UpsertActiveSalesPrices(int? newID, int? srcID, DateTime asOf)
             {
                 if (newID == null || srcID == null) return;
 
-                PXTrace.WriteInformation("PRICE‑COPY start: SrcID={0} → NewID={1}, AsOf={2:d}", srcID, newID, asOf);
+                PXTrace.WriteInformation("PRICE-COPY start: SrcID={0} → NewID={1}, AsOf={2:d}", srcID, newID, asOf);
 
                 int chosen = 0, inserted = 0, failed = 0;
                 var errors = new List<string>();
 
                 using (PriceCascade.Suppress())
                 {
-                    var g = new PXGraph();
+                    var g = PXGraph.CreateInstance<ARSalesPriceMaint>();
                     var spCache = g.Caches<ARSalesPrice>();
 
                     var srcRows = SelectFrom<ARSalesPrice>
@@ -249,10 +304,12 @@ namespace PX.Custom.IN
                                   .ToList();
 
                     chosen = srcRows.Count;
-                    PXTrace.WriteInformation("PRICE‑COPY picked {0} active rows", chosen);
+                    PXTrace.WriteInformation("PRICE-COPY picked {0} active rows", chosen);
 
                     foreach (var src in srcRows)
                     {
+                        PXTrace.WriteInformation("SRC: {0}",
+                            DumpRow(spCache, src));
                         try
                         {
                             var dst = (ARSalesPrice)spCache.CreateInstance();
@@ -260,26 +317,30 @@ namespace PX.Custom.IN
                             dst.InventoryID = newID;
                             dst.PriceType = src.PriceType;
 
-                            /* --- key‑field normalisation ------------------------------------ */
-                            if (src.PriceType == PRICE_TYPE_CUSTOMER_CLASS)
+                            /* key-field normalisation */
+                            if (src.PriceType == PT_CUSTOMER_CLASS)
                             {
-                                dst.PriceClassID = src.PriceClassID;
-                                dst.PriceCode = !string.IsNullOrWhiteSpace(src.PriceCode)
-                                                   ? src.PriceCode
-                                                   : src.PriceClassID;
+                                string classCode = !string.IsNullOrWhiteSpace(src.CustPriceClassID)
+                                                 ? src.CustPriceClassID
+                                                 : src.PriceCode;
+
+                                if (string.IsNullOrWhiteSpace(classCode))
+                                    throw new PXException("Source price row lacks class code.");
+
+                                dst.PriceClassID = classCode;
+                                dst.PriceCode = classCode;
                             }
-                            else if (src.PriceType == PRICE_TYPE_CUSTOMER)
+                            else if (src.PriceType == PT_CUSTOMER)
                             {
                                 dst.CustomerID = src.CustomerID;
                                 dst.PriceCode = !string.IsNullOrWhiteSpace(src.PriceCode)
-                                                   ? src.PriceCode
-                                                   : ResolveCustomerCode(g, src.CustomerID);
+                                               ? src.PriceCode
+                                               : ResolveCustomerCode(g, src.CustomerID);
                             }
-                            else    /* base, all‑customers, etc. */
+                            else /* base / all customers */
                             {
                                 dst.PriceCode = string.Empty;
                             }
-                            /* ---------------------------------------------------------------- */
 
                             dst.UOM = src.UOM;
                             dst.CuryID = src.CuryID ?? string.Empty;
@@ -291,8 +352,8 @@ namespace PX.Custom.IN
 
                             spCache.Insert(dst);
                             inserted++;
-                            PXTrace.WriteInformation("PRICE‑COPY inserted row: NewID={0} PT={1} PC={2} UOM={3} Price={4}",
-                                newID, dst.PriceType, dst.PriceCode, dst.UOM, dst.SalesPrice);
+                            PXTrace.WriteInformation("PRICE-COPY inserted row: PT={0} PC={1} Price={2}",
+                                dst.PriceType, dst.PriceCode, dst.SalesPrice);
                         }
                         catch (Exception ex)
                         {
@@ -303,9 +364,9 @@ namespace PX.Custom.IN
                     }
                     g.Persist();
                 }
-                PXTrace.WriteInformation("PRICE‑COPY done. Selected={0}, Inserted={1}, Failed={2}", chosen, inserted, failed);
+                PXTrace.WriteInformation("PRICE-COPY done. Selected={0}, Inserted={1}, Failed={2}", chosen, inserted, failed);
                 if (failed > 0)
-                    PXTrace.WriteInformation("PRICE‑COPY failures:\n{0}", string.Join("\n", errors));
+                    PXTrace.WriteInformation("PRICE-COPY failures:\n{0}", string.Join("\n", errors));
             }
 
             private static string ResolveCustomerCode(PXGraph g, int? customerID)
