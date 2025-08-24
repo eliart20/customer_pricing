@@ -64,37 +64,31 @@ namespace PX.Custom.IN
         #endregion
     }
 
-    // Custom class to handle redirect after PXLongOperation completes
-    public class RedirectToItemCustomInfo : IPXCustomInfo
+    // Custom class to handle completion after PXLongOperation
+    public class ItemCopyCompletedInfo : IPXCustomInfo
     {
         private readonly int? _inventoryID;
+        private readonly string _inventoryCD;
         
-        public RedirectToItemCustomInfo(int? inventoryID)
+        public ItemCopyCompletedInfo(int? inventoryID, string inventoryCD)
         {
             _inventoryID = inventoryID;
+            _inventoryCD = inventoryCD;
         }
         
         public void Complete(PXLongRunStatus status, PXGraph graph)
         {
             if (status == PXLongRunStatus.Completed && _inventoryID != null)
             {
-                // Create a fresh graph instance for the redirect
+                // Navigate to the new item in the same window
+                // This properly completes the operation
                 InventoryItemMaint redirectGraph = PXGraph.CreateInstance<InventoryItemMaint>();
+                redirectGraph.Item.Current = redirectGraph.Item.Search<InventoryItem.inventoryID>(_inventoryID);
                 
-                // Force database read using PXSelectReadOnly to avoid cache issues
-                InventoryItem newItem = PXSelect<InventoryItem,
-                    Where<InventoryItem.inventoryID, Equal<Required<InventoryItem.inventoryID>>>>
-                    .Select(redirectGraph, _inventoryID);
-                
-                if (newItem != null)
+                if (redirectGraph.Item.Current != null)
                 {
-                    // Set the current item explicitly
-                    redirectGraph.Item.Current = newItem;
-                    redirectGraph.Item.Cache.IsDirty = false;
-                    
-                    // Use PXRedirectRequiredException without WindowMode for same window
-                    // The 'false' parameter ensures same window navigation
-                    throw new PXRedirectRequiredException(redirectGraph, true, "Item Copied");
+                    // Same window redirect - operation completes properly
+                    throw new PXRedirectRequiredException(redirectGraph, false, "Item Copied");
                 }
             }
         }
@@ -162,19 +156,31 @@ namespace PX.Custom.IN
                 CopyPrices = ftr.CopyPrices == true
             };
 
+            // Store the new inventory CD for the custom info
+            string newInventoryCD = cmd.NewInventoryCD;
+
             PXLongOperation.StartOperation(Base, delegate()
             {
-                var newInventoryID = Worker.Execute(cmd);
-                PXTrace.WriteInformation("REDIRECT: Worker completed, newInventoryID={0}", newInventoryID);
-                
-                if (newInventoryID != null)
+                try
                 {
-                    // Set custom info to handle redirect after operation completes
-                    PXLongOperation.SetCustomInfo(new RedirectToItemCustomInfo(newInventoryID));
+                    var newInventoryID = Worker.Execute(cmd);
+                    PXTrace.WriteInformation("REDIRECT: Worker completed, newInventoryID={0}", newInventoryID);
+                    
+                    if (newInventoryID != null)
+                    {
+                        // Set custom info to handle redirect after operation completes
+                        // This ensures the long operation completes before redirect
+                        PXLongOperation.SetCustomInfo(new ItemCopyCompletedInfo(newInventoryID, newInventoryCD));
+                    }
+                    else
+                    {
+                        throw new PXException("Failed to create new item.");
+                    }
                 }
-                else
+                catch (Exception ex)
                 {
-                    throw new PXException("Failed to create new item.");
+                    PXTrace.WriteError(ex);
+                    throw new PXOperationCompletedException(ex.Message);
                 }
             });
 
