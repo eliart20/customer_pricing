@@ -64,6 +64,51 @@ namespace PX.Custom.IN
         #endregion
     }
 
+    // Custom class to handle redirect after PXLongOperation completes
+    public class RedirectToItemCustomInfo : IPXCustomInfo
+    {
+        private readonly int? _inventoryID;
+        private readonly string _inventoryCD;
+        
+        public RedirectToItemCustomInfo(int? inventoryID, string inventoryCD)
+        {
+            _inventoryID = inventoryID;
+            _inventoryCD = inventoryCD;
+        }
+        
+        public void Complete(PXLongRunStatus status, PXGraph graph)
+        {
+            if (status == PXLongRunStatus.Completed && _inventoryID != null)
+            {
+                // Create a fresh graph instance for the redirect
+                InventoryItemMaint redirectGraph = PXGraph.CreateInstance<InventoryItemMaint>();
+                
+                // Force database read to ensure the item exists
+                InventoryItem newItem = PXSelect<InventoryItem,
+                    Where<InventoryItem.inventoryID, Equal<Required<InventoryItem.inventoryID>>>>
+                    .Select(redirectGraph, _inventoryID);
+                
+                if (newItem != null)
+                {
+                    // Set the current item explicitly
+                    redirectGraph.Item.Current = newItem;
+                    redirectGraph.Item.Cache.IsDirty = false;
+                    
+                    // Throw redirect to new window/tab
+                    throw new PXRedirectRequiredException(redirectGraph, true, "Item Copied")
+                    {
+                        Mode = PXBaseRedirectException.WindowMode.New
+                    };
+                }
+                else
+                {
+                    // If item not found, show error message
+                    throw new PXException($"Could not find the newly created item {_inventoryCD}");
+                }
+            }
+        }
+    }
+
     public class InventoryItemMaint_CopyItemExt : PXGraphExtension<InventoryItemMaint>
     {
         private const string SkipSetDefaultSiteSlot = "PX.Custom.IN.CopyItem.SkipSetDefaultSite";
@@ -126,37 +171,26 @@ namespace PX.Custom.IN
                 CopyPrices = ftr.CopyPrices == true
             };
 
+            // Store the new inventory CD for the custom info
+            string newInventoryCD = cmd.NewInventoryCD;
+
             PXLongOperation.StartOperation(Base, delegate()
             {
                 try
                 {
                     var newInventoryID = Worker.Execute(cmd);
                     PXTrace.WriteInformation("REDIRECT: Worker completed, newInventoryID={0}", newInventoryID);
-
-                    if (newInventoryID == null)
+                    
+                    if (newInventoryID != null)
+                    {
+                        // Set custom info to handle redirect after operation completes
+                        // This ensures the long operation completes before redirect
+                        PXLongOperation.SetCustomInfo(new RedirectToItemCustomInfo(newInventoryID, newInventoryCD));
+                    }
+                    else
+                    {
                         throw new PXException("Failed to create new item.");
-
-                    // Redirect immediately from inside the long-op context.
-                    var redirectGraph = PXGraph.CreateInstance<InventoryItemMaint>();
-                    redirectGraph.Clear();
-
-                    // Prefer key search by InventoryCD which matches the primary view key.
-                    var newRow = redirectGraph.Item.Search<InventoryItem.inventoryCD>(cmd.NewInventoryCD)
-                               ?? redirectGraph.Item.Search<InventoryItem.inventoryID>(newInventoryID);
-
-                    if (newRow == null)
-                        throw new PXException("New item not found after copy.");
-
-                    redirectGraph.Item.Current = newRow;
-
-                    var ex = new PXRedirectRequiredException(redirectGraph, "Item Copied");
-                    ex.Mode = PXBaseRedirectException.WindowMode.Same;
-                    throw ex;
-                }
-                catch (PXRedirectRequiredException)
-                {
-                    // Rethrow redirect as-is to let the framework handle it.
-                    throw;
+                    }
                 }
                 catch (Exception ex)
                 {
