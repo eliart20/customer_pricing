@@ -4,3 +4,5 @@
 */debug/*
 */bin/*
 */obj/*
+/.claude
+*/.claude/*
